@@ -28,4 +28,9 @@ node_modules
 
 .idea
 test/mocha.opts
+<<<<<<< HEAD
 # lib //adding back lib for docker changes
+=======
+lib
+package-lock.json
+>>>>>>> upstream/master

@@ -2,13 +2,14 @@ import Sequelize from 'sequelize';
 import shimmer from 'shimmer';
 import DataLoader from 'dataloader';
 import Promise from 'bluebird';
-import {groupBy, property, values, clone, isEmpty} from 'lodash';
+import {groupBy, property, values, clone, isEmpty, uniq} from 'lodash';
 import LRU from 'lru-cache';
 import assert from 'assert';
+import {methods} from './helper';
 
 function mapResult(attribute, keys, options, result) {
   // Convert an array of results to an object of attribute (primary / foreign / target key) -> array of matching rows
-  if (Array.isArray(attribute) && options.multiple && !options.raw) {
+  if (Array.isArray(attribute) && options && options.multiple && !options.raw) {
     // Regular belongs to many
     let [throughAttribute, foreignKey] = attribute;
     result = result.reduce((carry, row) => {
@@ -35,9 +36,9 @@ function mapResult(attribute, keys, options, result) {
     if (key in result) {
       let value = result[key];
 
-      return options.multiple ? value : value[0];
+      return options && options.multiple ? value : value[0];
     }
-    return options.multiple ? [] : null;
+    return options && options.multiple ? [] : null;
   });
 }
 
@@ -54,6 +55,7 @@ function stringifyValue(value, key) {
     }
     return value.map(stringifyValue).join(',');
   } else if (typeof value === 'object' && value !== null) {
+    if (value instanceof Date) return value.toJSON();
     return stringifyObject(value);
   }
   return value;
@@ -62,21 +64,32 @@ function stringifyValue(value, key) {
 // This is basically a home-grown JSON.stringifier. However, JSON.stringify on objects
 // depends on the order in which the properties were defined - which we don't like!
 // Additionally, JSON.stringify escapes strings, which we don't need here
-function stringifyObject(object, keys = Object.keys(object)) {
-  return keys.sort().map(key => `${key}:${stringifyValue(object[key], key)}`).join('|');
+function stringifyObject(object, keys = [...Object.keys(object), ...Object.getOwnPropertySymbols(object)]) {
+  return keys.sort((lhs, rhs) => {
+    const l = lhs.toString();
+    const r = rhs.toString();
+    if (l > r) return 1;
+    if (l < r) return -1;
+    return 0;
+  }).map(key => `${key.toString()}:${stringifyValue(object[key], key)}`).join('|');
 }
 
 export function getCacheKey(model, attribute, options) {
   // TODO: better way?? related to changes in graphql-sequelize so that findOptions have requestUser
-  options = stringifyObject(options, ['association', 'attributes', 'groupedLimit', 'limit', 'offset', 'order', 'where', 'through', 'raw', 'requestUser']);
+  options = stringifyObject(options, ['association', 'attributes', 'groupedLimit', 'limit', 'offset', 'order', 'where', 'through', 'raw', 'requestUser', 'searchPath', 'paranoid']);
 
-  return `${model.name}|${attribute}|${options}`;
+  let name = `${model.name}|${attribute}|${options}`;
+  const schema = model.options && model.options.schema;
+  if (schema) {
+    name = `${schema}|${name}`;
+  }
+  return name;
 }
 
 function mergeWhere(where, optionsWhere) {
   if (optionsWhere) {
     return {
-      $and: [where, optionsWhere]
+      [Sequelize.Op ? Sequelize.Op.and : '$and']: [where, optionsWhere]
     };
   }
   return where;
@@ -100,89 +113,80 @@ function loaderForBTM(model, joinTableName, foreignKey, foreignKeyField, options
   assert(options.include === undefined, 'options.include is not supported by model loader');
   assert(options.association !== undefined, 'options.association should be set for BTM loader');
 
-  let attributes = [joinTableName, foreignKey]
-    , cacheKey = getCacheKey(model, attributes, options)
-    , association = options.association;
+  let attributes = [joinTableName, foreignKey];
+  const association = options.association;
   delete options.association;
 
-  if (!cache.has(cacheKey)) {
-    cache.set(cacheKey, new DataLoader(keys => {
-      let findOptions = Object.assign({}, options);
-      delete findOptions.rejectOnEmpty;
-      if (findOptions.limit) {
-        findOptions.groupedLimit = {
-          through: options.through,
-          on: association,
-          limit: findOptions.limit,
-          offset: findOptions.offset,
-          values: keys
-        };
-      } else {
-        findOptions.include = [{
-          // need to get all attributes of through table in the query only when count/group is not happening
-          attributes: findOptions.group ? [foreignKey] : null,
-          association: association.manyFromSource,
-          where: {
-            [foreignKeyField]: keys,
-            ...options.through.where
-          }
-        }];
-      }
+  return new DataLoader(keys => {
+    let findOptions = Object.assign({}, options);
+    delete findOptions.rejectOnEmpty;
+    if (findOptions.limit) {
+      const limit = findOptions.offset && findOptions.offset > 0 ? [findOptions.limit, findOptions.offset] : findOptions.limit;
+      findOptions.groupedLimit = {
+        through: options.through,
+        on: association,
+        limit,
+        values: uniq(keys)
+      };
+    } else {
+      findOptions.include = [{
+        attributes: [foreignKey],
+        association: association.manyFromSource,
+        where: {
+          [foreignKeyField]: keys,
+          ...options.through.where
+        }
+      }];
+    }
 
-      return model.findAll(findOptions).then(mapResult.bind(null, attributes, keys, findOptions));
-    }, {
-      cache: false
-    }));
-  }
-
-  return cache.get(cacheKey);
+    return model.findAll(findOptions).then(mapResult.bind(null, attributes, keys, findOptions));
+  }, {
+    cache: options.cache
+  });
 }
 
 function loaderForModel(model, attribute, attributeField, options = {}) {
   assert(options.include === undefined, 'options.include is not supported by model loader');
 
-  let cacheKey = getCacheKey(model, attribute, options);
+  return new DataLoader(keys => {
+    const findOptions = Object.assign({}, options);
+    delete findOptions.rejectOnEmpty;
 
-  if (!cache.has(cacheKey)) {
-    cache.set(cacheKey, new DataLoader(keys => {
-      const findOptions = Object.assign({}, options);
-      delete findOptions.rejectOnEmpty;
+    if (findOptions.limit && keys.length > 1) {
+      const limit = findOptions.offset && findOptions.offset > 0 ? [findOptions.limit, findOptions.offset] : findOptions.limit;
+      findOptions.groupedLimit = {
+        limit,
+        on: attributeField,
+        values: uniq(keys)
+      };
+      delete findOptions.limit;
+      delete findOptions.offset;
+    } else {
+      findOptions.where = mergeWhere({
+        [attributeField]: keys
+      }, findOptions.where);
+    }
 
-      if (findOptions.limit && keys.length > 1) {
-        findOptions.groupedLimit = {
-          limit: findOptions.limit,
-          on: attributeField,
-          values: keys
-        };
-        delete findOptions.limit;
-      } else {
-        findOptions.where = mergeWhere({
-          [attributeField]: keys
-        }, findOptions.where);
-      }
-
-      return model.findAll(findOptions).then(mapResult.bind(null, attribute, keys, findOptions));
-    }, {
-      cache: false
-    }));
-  }
-
-  return cache.get(cacheKey);
+    return model.findAll(findOptions).then(mapResult.bind(null, attribute, keys, options));
+  }, {
+    cache: options.cache
+  });
 }
 
 function shimModel(target) {
-  if (target.findById.__wrapped) return;
+  if (target.findByPk ? target.findByPk.__wrapped : target.findById.__wrapped) return;
 
-  shimmer.massWrap(target, ['findById', 'findByPrimary'], original => {
+  shimmer.massWrap(target, methods(Sequelize.version).findByPk, original => {
     return function batchedFindById(id, options = {}) {
       if ([null, undefined].indexOf(id) !== -1) {
         return Promise.resolve(null);
       }
-      if (options.transaction || options.include) {
+      if (options.transaction || options.include || activeClsTransaction() || !options[EXPECTED_OPTIONS_KEY]) {
         return original.apply(this, arguments);
       }
-      // TODO: review this approach later. Add options so that request parameters can be passed on if required
-      return loaderForModel(this, this.primaryKeyAttribute, this.primaryKeyField, options).load(id).then(rejectOnEmpty.bind(null, options));
+
+      const loader = options[EXPECTED_OPTIONS_KEY].loaders[this.name].byPrimaryKey;
+      return Promise.resolve(loader.load(id)).then(rejectOnEmpty.bind(null, options));
     };
   });
 }
@@ -192,7 +196,7 @@ function shimBelongsTo(target) {
 
   shimmer.wrap(target, 'get', original => {
     return function batchedGetBelongsTo(instance, options = {}) {
-      if (Array.isArray(instance) || options.include || options.transaction) {
+      if (Array.isArray(instance) || options.include || options.transaction || activeClsTransaction() || !options[EXPECTED_OPTIONS_KEY] || options.where) {
         return original.apply(this, arguments);
       }
 
@@ -201,8 +205,9 @@ function shimBelongsTo(target) {
         if (foreignKeyValue === undefined || foreignKeyValue === null) {
           return Promise.resolve(null);
         }
-        let loader = loaderForModel(this.target, this.targetKey, this.targetKeyField, options);
-        return loader.load(foreignKeyValue);
+
+        const loader = options[EXPECTED_OPTIONS_KEY].loaders[this.target.name].bySingleAttribute[this.targetKey];
+        return Promise.resolve(loader.load(foreignKeyValue));
       }).then(rejectOnEmpty.bind(null, options));
     };
   });
@@ -213,7 +218,7 @@ function shimHasOne(target) {
 
   shimmer.wrap(target, 'get', original => {
     return function batchedGetHasOne(instance, options = {}) {
-      if (Array.isArray(instance) || options.include || options.transaction) {
+      if (Array.isArray(instance) || options.include || options.transaction || activeClsTransaction() || !options[EXPECTED_OPTIONS_KEY]) {
         return original.apply(this, arguments);
       }
 
@@ -232,8 +237,8 @@ function shimHasOne(target) {
         };
       }
 
-      let loader = loaderForModel(this.target, this.foreignKey, this.identifierField, options);
-      return loader.load(instance.get(this.sourceKey)).then(rejectOnEmpty.bind(null, options));
+      const loader = options[EXPECTED_OPTIONS_KEY].loaders[this.target.name].bySingleAttribute[this.foreignKey];
+      return Promise.resolve(loader.load(instance.get(this.sourceKey)).then(rejectOnEmpty.bind(null, options)));
     };
   });
 }
@@ -244,7 +249,7 @@ function shimHasMany(target) {
   shimmer.wrap(target, 'get', original => {
     return function bathedGetHasMany(instances, options = {}) {
       let isCount = false;
-      if (options.include || options.transaction) {
+      if (options.include || options.transaction || options.separate || activeClsTransaction() || !options[EXPECTED_OPTIONS_KEY]) {
         return original.apply(this, arguments);
       }
 
@@ -268,24 +273,49 @@ function shimHasMany(target) {
           scope = scope(options, instances);
         }
         options.where = {
-          $and: [
+          [Sequelize.Op ? Sequelize.Op.and : '$and']: [
             options.where,
             scope
           ]
         };
       }
 
-      let loader = loaderForModel(this.target, this.foreignKey, this.foreignKeyField, {
-        multiple: true,
-        ...options
-      });
+      let loader = null
+        , loaderOptions = {
+          multiple: true,
+          ...options
+        };
+
+      const cacheKey = getCacheKey(this.target, this.foreignKey, loaderOptions);
+      loader = options[EXPECTED_OPTIONS_KEY].loaders.autogenerated.get(cacheKey);
+      if (!loader) {
+        loader = loaderForModel(this.target, this.foreignKey, this.foreignKeyField, {
+          ...loaderOptions,
+          cache: true
+        });
+        options[EXPECTED_OPTIONS_KEY].loaders.autogenerated.set(cacheKey, loader);
+      }
 
       let key = this.sourceKey || this.source.primaryKeyAttribute;
 
       if (Array.isArray(instances)) {
-        return Promise.map(instances, instance => loader.load(instance.get(key)));
+        return Promise.map(instances, instance => {
+          let sourceKeyValue = instance.get(key);
+
+          if (sourceKeyValue === undefined || sourceKeyValue === null) {
+            return Promise.resolve(null);
+          }
+
+          return loader.load(sourceKeyValue);
+        });
       } else {
-        return loader.load(instances.get(key)).then(result => {
+        let sourceKeyValue = instances.get(key);
+
+        if (sourceKeyValue === undefined || sourceKeyValue === null) {
+          return Promise.resolve(null);
+        }
+
+        return Promise.resolve(loader.load(sourceKeyValue)).then(result => {
           if (isCount && !result) {
             result = { count: 0 };
           }
@@ -304,7 +334,7 @@ function shimBelongsToMany(target) {
       let isCount = false;
       assert(this.paired, '.paired missing on belongsToMany association. You need to set up both sides of the association');
 
-      if (options.include || options.transaction) {
+      if (options.include || options.transaction || activeClsTransaction() || !options[EXPECTED_OPTIONS_KEY]) {
         return original.apply(this, arguments);
       }
 
@@ -327,7 +357,7 @@ function shimBelongsToMany(target) {
           scope = scope(options, instances);
         }
         options.where = {
-          $and: [
+          [Sequelize.Op ? Sequelize.Op.and : '$and']: [
             options.where,
             scope
           ]
@@ -344,23 +374,34 @@ function shimBelongsToMany(target) {
           scope = scope(options, instances);
         }
         options.through.where = {
-          $and: [
+          [Sequelize.Op ? Sequelize.Op.and : '$and']: [
             options.through.where,
             scope
           ]
         };
       }
 
-      let loader = loaderForBTM(this.target, this.paired.manyFromSource.as, this.foreignKey, this.identifierField, {
-        association: this.paired,
-        multiple: true,
-        ...options
-      });
+      let loader
+        , loaderOptions = {
+          association: this.paired,
+          multiple: true,
+          ...options
+        };
+
+      const cacheKey = getCacheKey(this.target, [this.paired.manyFromSource.as, this.foreignKey], loaderOptions);
+      loader = options[EXPECTED_OPTIONS_KEY].loaders.autogenerated.get(cacheKey);
+      if (!loader) {
+        loader = loaderForBTM(this.target, this.paired.manyFromSource.as, this.foreignKey, this.identifierField, {
+          ...loaderOptions,
+          cache: true
+        });
+        options[EXPECTED_OPTIONS_KEY].loaders.autogenerated.set(cacheKey, loader);
+      }
 
       if (Array.isArray(instances)) {
         return Promise.map(instances, instance => loader.load(instance.get(this.source.primaryKeyAttribute)));
       } else {
-        return loader.load(instances.get(this.source.primaryKeyAttribute)).then(result => {
+        return Promise.resolve(loader.load(instances.get(this.source.primaryKeyAttribute))).then(result => {
           if (isCount && !result) {
             result = { count: 0 };
           }
@@ -371,41 +412,77 @@ function shimBelongsToMany(target) {
   });
 }
 
-function shimAssociation(association) {
-  switch (association.associationType) {
-    case 'BelongsTo': return shimBelongsTo(association);
-    case 'HasOne': return shimHasOne(association);
-    case 'HasMany': return shimHasMany(association);
-    case 'BelongsToMany': return shimBelongsToMany(association);
+function activeClsTransaction() {
+  if (/^[45]/.test(Sequelize.version)) {
+    if (Sequelize._cls && Sequelize._cls.get('transaction')) {
+      return true;
+    }
+  } else if (Sequelize.cls && Sequelize.cls.get('transaction')) {
+    return true;
   }
+  return false;
 }
 
-let cache;
-export function resetCache() {
-  if (cache) cache.reset();
+export const EXPECTED_OPTIONS_KEY = 'dataloader_sequelize_context';
+export function createContext(sequelize, options = {}) {
+  const loaders = {};
+
+  shimModel(/^[45]/.test(sequelize.constructor.version) ? // v3 vs v4
+    sequelize.constructor.Model : sequelize.constructor.Model.prototype);
+  shimBelongsTo(sequelize.constructor.Association.BelongsTo.prototype);
+  shimHasOne(sequelize.constructor.Association.HasOne.prototype);
+  shimHasMany(sequelize.constructor.Association.HasMany.prototype);
+  shimBelongsToMany(sequelize.constructor.Association.BelongsToMany.prototype);
+
+  loaders.autogenerated = LRU({max: options.max || 500});
+
+  sequelize.modelManager.forEachModel(Model => {
+    loaders[Model.name] = {
+      bySingleAttribute: {}
+    };
+    loaders[Model.name].bySingleAttribute[Model.primaryKeyAttribute] = createModelAttributeLoader(Model, Model.primaryKeyAttribute, options);
+    loaders[Model.name].byId = loaders[Model.name].byPrimaryKey = loaders[Model.name].bySingleAttribute[Model.primaryKeyAttribute];
+  });
+
+  sequelize.modelManager.forEachModel(Model => {
+    values(Model.associations).forEach(association => {
+      if (association.associationType === 'BelongsTo') {
+        const Target = association.target;
+        if (association.targetKey !== Target.primaryKeyAttribute) {
+          loaders[Target.name].bySingleAttribute[association.targetKey] = createModelAttributeLoader(Target, association.targetKey, options);
+        }
+      } else if (association.associationType === 'HasOne') {
+        const Target = association.target;
+        loaders[Target.name].bySingleAttribute[association.foreignKey] = createModelAttributeLoader(Target, association.foreignKey, options);
+      }
+    });
+  });
+
+  function prime(results) {
+    if (!Array.isArray(results)) {
+      results = [results];
+    }
+
+    results.forEach(result => {
+      const modelName = result.Model ? result.Model.name : result.constructor.name;
+      Object.keys(loaders[modelName].bySingleAttribute).forEach(attribute => {
+        loaders[modelName].bySingleAttribute[attribute].prime(result.get(attribute), result);
+      });
+    });
+  }
+
+  return {loaders, prime};
 }
-export default function (target, options = {}) {
-  options = {
-    ...options,
-    max: 500
-  };
 
-  if (!cache) {
-    cache = LRU(options);
-  }
-
-  if (target.associationType) {
-    shimAssociation(target);
-  // change for sequelize 4.0.0.2
-  } else if (target.toString().includes('Model')) {
-    shimModel(target);
-    values(target.associations).forEach(shimAssociation);
-  } else {
-    // Assume target is the sequelize constructor
-    shimModel(target.Model.prototype);
-    shimBelongsTo(target.Association.BelongsTo.prototype);
-    shimHasOne(target.Association.HasOne.prototype);
-    shimHasMany(target.Association.HasMany.prototype);
-    shimBelongsToMany(target.Association.BelongsToMany.prototype);
-  }
+function createModelAttributeLoader(Model, attribute, options = {}) {
+  return new DataLoader(keys => {
+    return Model.findAll({
+      where: {
+        [attribute]: keys
+      },
+      logging: options.logging
+    }).then(mapResult.bind(null, attribute, keys, {}));
+  }, {
+    cache: true
+  });
 }

@@ -5,6 +5,7 @@ import Promise from 'bluebird';
 import {groupBy, property, values, clone, isEmpty} from 'lodash';
 import LRU from 'lru-cache';
 import assert from 'assert';
+import {methods} from './helper';
 
 function mapResult(attribute, keys, options, result) {
   // Convert an array of results to an object of attribute (primary / foreign / target key) -> array of matching rows
@@ -173,7 +174,7 @@ function loaderForModel(model, attribute, attributeField, options = {}) {
 function shimModel(target) {
   if (target.findById.__wrapped) return;
 
-  shimmer.massWrap(target, ['findById', 'findByPrimary'], original => {
+  shimmer.massWrap(target, methods(Sequelize.version).findByPk, original => {
     return function batchedFindById(id, options = {}) {
       if ([null, undefined].indexOf(id) !== -1) {
         return Promise.resolve(null);

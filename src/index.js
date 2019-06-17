@@ -172,7 +172,7 @@ function loaderForModel(model, attribute, attributeField, options = {}) {
 }
 
 function shimModel(target) {
-  if (target.findById.__wrapped) return;
+  if (target.findByPk ? target.findByPk.__wrapped : target.findById.__wrapped) return;
 
   shimmer.massWrap(target, methods(Sequelize.version).findByPk, original => {
     return function batchedFindById(id, options = {}) {

@@ -42,6 +42,38 @@ function mapResult(attribute, keys, options, result) {
   });
 }
 
+function stringifyValue(value, key) {
+  // TODO: better way?? related to changes in graphql-sequelize so that findOptions have requestUser
+  if (value && key === "requestUser") {
+    return `${value.id}`;
+  } else if (value && value.associationType) {
+    return `${value.associationType},${value.target.name},${value.as}`;
+  } else if (Array.isArray(value)) {
+    if (key !== 'order') {
+      // attribute order doesn't matter - order order definitely does
+      value = clone(value).sort();
+    }
+    return value.map(stringifyValue).join(',');
+  } else if (typeof value === 'object' && value !== null) {
+    return stringifyObject(value);
+  }
+  return value;
+}
+
+// This is basically a home-grown JSON.stringifier. However, JSON.stringify on objects
+// depends on the order in which the properties were defined - which we don't like!
+// Additionally, JSON.stringify escapes strings, which we don't need here
+function stringifyObject(object, keys = (Object.keys(object).concat(Object.getOwnPropertySymbols(object)))) {
+  return keys.sort().map(key => `${key.toString()}:${stringifyValue(object[key], key)}`).join('|');
+}
+
+export function getCacheKey(model, attribute, options) {
+  // TODO: better way?? related to changes in graphql-sequelize so that findOptions have requestUser
+  options = stringifyObject(options, ['association', 'attributes', 'groupedLimit', 'limit', 'offset', 'order', 'where', 'through', 'raw', 'requestUser', 'useMaster']);
+
+  return `${model.name}|${attribute}|${options}`;
+}
+
 function mergeWhere(where, optionsWhere) {
   if (optionsWhere) {
     return {
@@ -70,63 +102,73 @@ function loaderForBTM(model, joinTableName, foreignKey, foreignKeyField, options
   assert(options.association !== undefined, 'options.association should be set for BTM loader');
 
   let attributes = [joinTableName, foreignKey]
+    , cacheKey = getCacheKey(model, attributes, options)
     , association = options.association;
   delete options.association;
 
-  return new DataLoader(keys => {
-    let findOptions = Object.assign({}, options);
-    delete findOptions.rejectOnEmpty;
-    if (findOptions.limit) {
-      findOptions.groupedLimit = {
-        through: options.through,
-        on: association,
-        limit: findOptions.limit,
-        offset: findOptions.offset,
-        values: keys
-      };
-    } else {
-      findOptions.include = [{
-        // need to get all attributes of through table in the query only when count/group is not happening
-        attributes: findOptions.group ? [foreignKey] : null,
-        association: association.manyFromSource,
-        where: {
-          [foreignKeyField]: keys,
-          ...options.through.where
-        }
-      }];
-    }
+  if (!cache.has(cacheKey)) {
+    cache.set(cacheKey, new DataLoader(keys => {
+      let findOptions = Object.assign({}, options);
+      delete findOptions.rejectOnEmpty;
+      if (findOptions.limit) {
+        findOptions.groupedLimit = {
+          through: options.through,
+          on: association,
+          limit: findOptions.limit,
+          offset: findOptions.offset,
+          values: keys
+        };
+      } else {
+        findOptions.include = [{
+          // need to get all attributes of through table in the query only when count/group is not happening
+          attributes: findOptions.group ? [foreignKey] : null,
+          association: association.manyFromSource,
+          where: {
+            [foreignKeyField]: keys,
+            ...options.through.where
+          }
+        }];
+      }
 
-    return model.findAll(findOptions).then(mapResult.bind(null, attributes, keys, findOptions));
-  }, {
-    cache: false
-  });
+      return model.findAll(findOptions).then(mapResult.bind(null, attributes, keys, findOptions));
+    }, {
+      cache: false
+    }));
+  }
 
+  return cache.get(cacheKey);
 }
 
 function loaderForModel(model, attribute, attributeField, options = {}) {
   assert(options.include === undefined, 'options.include is not supported by model loader');
 
-  return new DataLoader(keys => {
-    const findOptions = Object.assign({}, options);
-    delete findOptions.rejectOnEmpty;
+  let cacheKey = getCacheKey(model, attribute, options);
 
-    if (findOptions.limit && keys.length > 1) {
-      findOptions.groupedLimit = {
-        limit: findOptions.limit,
-        on: attributeField,
-        values: keys
-      };
-      delete findOptions.limit;
-    } else {
-      findOptions.where = mergeWhere({
-        [attributeField]: keys
-      }, findOptions.where);
-    }
+  if (!cache.has(cacheKey)) {
+    cache.set(cacheKey, new DataLoader(keys => {
+      const findOptions = Object.assign({}, options);
+      delete findOptions.rejectOnEmpty;
 
-    return model.findAll(findOptions).then(mapResult.bind(null, attribute, keys, findOptions));
-  }, {
-    cache: false
-  });
+      if (findOptions.limit && keys.length > 1) {
+        findOptions.groupedLimit = {
+          limit: findOptions.limit,
+          on: attributeField,
+          values: keys
+        };
+        delete findOptions.limit;
+      } else {
+        findOptions.where = mergeWhere({
+          [attributeField]: keys
+        }, findOptions.where);
+      }
+
+      return model.findAll(findOptions).then(mapResult.bind(null, attribute, keys, findOptions));
+    }, {
+      cache: false
+    }));
+  }
+
+  return cache.get(cacheKey);
 }
 
 function shimModel(target) {

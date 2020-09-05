@@ -69,7 +69,7 @@ function stringifyObject(object, keys = (Object.keys(object).concat(Object.getOw
 
 export function getCacheKey(model, attribute, options) {
   // TODO: better way?? related to changes in graphql-sequelize so that findOptions have requestUser
-  optionsKey = stringifyObject(options, ['association', 'attributes', 'groupedLimit', 'limit', 'offset', 'order', 'where', 'through', 'raw', 'requestUser']);
+  let optionsKey = stringifyObject(options, ['association', 'attributes', 'groupedLimit', 'limit', 'offset', 'order', 'where', 'through', 'raw', 'requestUser']);
 
   return `${model.name}|${attribute}|${optionsKey}`;
 }

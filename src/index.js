@@ -57,7 +57,7 @@ function stringifyValue(value, key) {
   } else if (typeof value === 'object' && value !== null) {
     return stringifyObject(value);
   }
-  return value == null ? "" : value;
+  return value;
 }
 
 // This is basically a home-grown JSON.stringifier. However, JSON.stringify on objects
@@ -70,9 +70,6 @@ function stringifyObject(object, keys = (Object.keys(object).concat(Object.getOw
 export function getCacheKey(model, attribute, options) {
   // TODO: better way?? related to changes in graphql-sequelize so that findOptions have requestUser
   options = stringifyObject(options, ['association', 'attributes', 'groupedLimit', 'limit', 'offset', 'order', 'where', 'through', 'raw', 'requestUser', 'useMaster']);
-  options = options.replace('requestUser:', 'rU:');
-  options = options.replace('useMaster:', 'uM:');
-  options = options.replace('groupedLimit:', 'gL:');
 
   return `${model.name}|${attribute}|${options}`;
 }
